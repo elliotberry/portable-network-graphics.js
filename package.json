@@ -4,5 +4,11 @@
     "author": "In a way, all of us",
     "version": "0.0.2",
     "main": "./index.js",
-    "type": "module"
+    "type": "module",
+    "engines": {
+        "node": ">=22"
+    },
+    "scripts": {
+        "test": "node --test index.test.js test/*.test.js"
+    }
 }

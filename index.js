@@ -1,15 +1,205 @@
-import zlib from 'node:zlib'; ;
+import { inflate, inflateSync } from 'node:zlib';
 import { Buffer } from 'node:buffer';
-import fs from 'fs';
+import fs from 'node:fs';
 
+// Decodes an inflated PNG data stream into raw pixel bytes. Takes plain
+// image metadata rather than the PNG instance so callers can hand over a
+// lightweight object instead of pinning the decoder's whole state.
+function decodePixelsData(meta, data) {
+  const { width, height, interlaceMethod, pixelBitlength } = meta;
 
-function isBuffer(obj) {
-    return Buffer.isBuffer(obj);
+  const pixelBytes = pixelBitlength / 8;
+
+  // Per the PNG spec, filtering treats sub-byte depths as one byte per
+  // pixel, and every scanline is padded to a whole byte. Using the
+  // rounded values keeps all offsets integral (fractional pixelBytes
+  // produces garbage neighbor reads and undersized buffers for
+  // 1/2/4-bit images).
+  const bytesPerPixel = Math.max(1, pixelBytes);
+  const fullRowBytes = Math.ceil(pixelBytes * width);
+
+  const pixels = new Uint8Array(height * fullRowBytes);
+  const { length } = data;
+  let pos = 0;
+
+  // Unfilters one scanline of `data` at `pos` into `row`, with `prev`
+  // the unfiltered scanline above (null for the first row of a pass).
+  // Scanlines only ever need their predecessor, so neighbor lookups
+  // are plain offsets instead of whole-buffer index arithmetic.
+  function unfilterRow(filter, rowBytes, row, prev) {
+    let i, left, upper, upperLeft;
+    switch (filter) {
+      case 0: // None
+        if (pos + rowBytes <= length) {
+          row.set(data.subarray(pos, pos + rowBytes));
+        } else {
+          // Truncated stream: missing trailing bytes read as zero,
+          // matching the filtered paths below.
+          row.fill(0);
+          row.set(data.subarray(pos, length));
+        }
+        break;
+
+      case 1: // Sub
+        for (i = 0; i < rowBytes; i++) {
+          left = i < bytesPerPixel ? 0 : row[i - bytesPerPixel];
+          row[i] = (data[pos + i] + left) & 0xff;
+        }
+        break;
+
+      case 2: // Up
+        for (i = 0; i < rowBytes; i++) {
+          upper = prev ? prev[i] : 0;
+          row[i] = (data[pos + i] + upper) & 0xff;
+        }
+        break;
+
+      case 3: // Average
+        for (i = 0; i < rowBytes; i++) {
+          left = i < bytesPerPixel ? 0 : row[i - bytesPerPixel];
+          upper = prev ? prev[i] : 0;
+          row[i] = (data[pos + i] + ((left + upper) >> 1)) & 0xff;
+        }
+        break;
+
+      case 4: // Paeth
+        for (i = 0; i < rowBytes; i++) {
+          left = i < bytesPerPixel ? 0 : row[i - bytesPerPixel];
+          if (prev) {
+            upper = prev[i];
+            upperLeft = i < bytesPerPixel ? 0 : prev[i - bytesPerPixel];
+          } else {
+            upper = upperLeft = 0;
+          }
+
+          const p = left + upper - upperLeft;
+          const pa = Math.abs(p - left);
+          const pb = Math.abs(p - upper);
+          const pc = Math.abs(p - upperLeft);
+
+          const paeth =
+            pa <= pb && pa <= pc ? left : pb <= pc ? upper : upperLeft;
+          row[i] = (data[pos + i] + paeth) & 0xff;
+        }
+        break;
+
+      default:
+        throw new Error(`Invalid filter algorithm: ${filter}`);
+    }
+    pos += rowBytes;
+  }
+
+  function singlePass() {
+    const rowBytes = fullRowBytes;
+    let offset = 0;
+    let row = 0;
+    // Rows are contiguous in `pixels`, so unfilter in place using the
+    // previous row's slice as the neighbor source.
+    while (row < height && pos < length) {
+      const filter = data[pos++];
+      const cur = pixels.subarray(offset, offset + rowBytes);
+      const prev =
+        row === 0 ? null : pixels.subarray(offset - rowBytes, offset);
+      unfilterRow(filter, rowBytes, cur, prev);
+      offset += rowBytes;
+      row++;
+    }
+  }
+
+  function interlaced() {
+    // Unfiltering only ever needs the current and previous scanline,
+    // so a two-row ring replaces whole-pass scratch buffers.
+    const ringA = new Uint8Array(fullRowBytes);
+    const ringB = new Uint8Array(fullRowBytes);
+
+    function pass(x0, y0, dx, dy) {
+      const w = Math.ceil((width - x0) / dx);
+      const h = Math.ceil((height - y0) / dy);
+      const rowBytes = Math.ceil(pixelBytes * w);
+      let cur = ringA.subarray(0, rowBytes);
+      let spare = ringB.subarray(0, rowBytes);
+      let prev = null;
+      let row = 0;
+      while (row < h && pos < length) {
+        const filter = data[pos++];
+        unfilterRow(filter, rowBytes, cur, prev);
+
+        let pixelsPos = ((y0 + row * dy) * width + x0) * pixelBytes;
+        if (
+          dx === 1 &&
+          Number.isInteger(pixelsPos) &&
+          pixelsPos + rowBytes <= pixels.length
+        ) {
+          pixels.set(cur, pixelsPos);
+        } else {
+          // Element writes tolerate fractional or out-of-range
+          // positions (sub-byte interlaced images can't be merged
+          // byte-addressably); they drop silently instead of throwing.
+          let bufferPos = 0;
+          for (let i = 0; i < w; i++) {
+            for (let j = 0; j < pixelBytes; j++)
+              pixels[pixelsPos++] = cur[bufferPos++];
+            pixelsPos += (dx - 1) * pixelBytes;
+          }
+        }
+
+        const next = prev === null ? spare : prev;
+        prev = cur;
+        cur = next;
+        row++;
+      }
+    }
+
+    /*
+      1 6 4 6 2 6 4 6
+      7 7 7 7 7 7 7 7
+      5 6 5 6 5 6 5 6
+      7 7 7 7 7 7 7 7
+      3 6 4 6 3 6 4 6
+      7 7 7 7 7 7 7 7
+      5 6 5 6 5 6 5 6
+      7 7 7 7 7 7 7 7
+    */
+    pass(0, 0, 8, 8); // 1
+    pass(4, 0, 8, 8); // 2
+    pass(0, 4, 4, 8); // 3
+    pass(2, 0, 4, 4); // 4
+    pass(0, 2, 2, 4); // 5
+    pass(1, 0, 2, 2); // 6
+    pass(0, 1, 1, 2); // 7
+  }
+
+  if (interlaceMethod === 1) {
+    interlaced();
+  } else {
+    singlePass();
+  }
+
+  return pixels;
+}
+
+// Decodes a byte array as latin1 without spreading it all onto the stack
+// (String.fromCharCode has an argument-count limit).
+function latin1(bytes) {
+  let result = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    result += String.fromCharCode.apply(String, bytes.slice(i, i + 0x8000));
+  }
+  return result;
 }
 
 export default class PNG {
+  static async decode(path) {
+    const file = await fs.promises.readFile(path);
+    return new PNG(file).decode();
+  }
+
+  static load(path) {
+    return new PNG(fs.readFileSync(path));
+  }
+
   constructor(data) {
-    if (!isBuffer(data)) {
+    if (!Buffer.isBuffer(data)) {
       throw new Error('PNG: expected Buffer');
     }
     let i;
@@ -21,16 +211,47 @@ export default class PNG {
     this.transparency = {};
     this.text = {};
 
+    // IDAT payloads are collected as views into the source buffer and
+    // concatenated exactly once at IEND, so the compressed stream is never
+    // held in more than one copy.
+    const idatChunks = [];
+    let idatLength = 0;
+
+    if (
+      data.length < 8 ||
+      data[0] !== 0x89 ||
+      data[1] !== 0x50 ||
+      data[2] !== 0x4e ||
+      data[3] !== 0x47 ||
+      data[4] !== 0x0d ||
+      data[5] !== 0x0a ||
+      data[6] !== 0x1a ||
+      data[7] !== 0x0a
+    ) {
+      throw new Error('Invalid PNG signature');
+    }
+
     while (true) {
+      if (this.pos + 8 > this.data.length) {
+        throw new Error('Incomplete or corrupt PNG file');
+      }
+
       const chunkSize = this.readUInt32();
       let section = '';
       for (i = 0; i < 4; i++) {
         section += String.fromCharCode(this.data[this.pos++]);
       }
 
+      // The chunk payload and its 4-byte CRC must fit in the remaining
+      // data, otherwise a corrupt length would drive huge allocations or
+      // out-of-bounds reads below.
+      if (chunkSize > this.data.length - this.pos - 4) {
+        throw new Error('Incomplete or corrupt PNG file');
+      }
+
       switch (section) {
         case 'IHDR':
-          // we can grab  interesting values from here (like width, height, etc)
+          // we can grab interesting values from here (like width, height, etc)
           this.width = this.readUInt32();
           this.height = this.readUInt32();
           this.bits = this.data[this.pos++];
@@ -38,6 +259,11 @@ export default class PNG {
           this.compressionMethod = this.data[this.pos++];
           this.filterMethod = this.data[this.pos++];
           this.interlaceMethod = this.data[this.pos++];
+          if (this.width === 0 || this.height === 0) {
+            throw new Error(
+              'Invalid PNG dimensions: width and height must be nonzero'
+            );
+          }
           break;
 
         case 'PLTE':
@@ -45,9 +271,9 @@ export default class PNG {
           break;
 
         case 'IDAT':
-          for (i = 0; i < chunkSize; i++) {
-            this.imgData.push(this.data[this.pos++]);
-          }
+          idatChunks.push(this.data.subarray(this.pos, this.pos + chunkSize));
+          idatLength += chunkSize;
+          this.pos += chunkSize;
           break;
 
         case 'tRNS':
@@ -55,7 +281,7 @@ export default class PNG {
           // PLTE chunk and before the IDAT chunk.
           this.transparency = {};
           switch (this.colorType) {
-            case 3:
+            case 3: {
               // Indexed color, RGB. Each byte in this chunk is an alpha for
               // the palette index in the PLTE ("palette") chunk up until the
               // last non-opaque entry. Set up an array, stretching over all
@@ -68,6 +294,7 @@ export default class PNG {
                 }
               }
               break;
+            }
             case 0:
               // Greyscale. Corresponding to entries in the PLTE chunk.
               // Grey is two bytes, range 0 .. (2 ^ bit-depth) - 1
@@ -80,14 +307,15 @@ export default class PNG {
           }
           break;
 
-        case 'tEXt':
+        case 'tEXt': {
           const text = this.read(chunkSize);
           const index = text.indexOf(0);
-          const key = String.fromCharCode(...text.slice(0, index));
-          this.text[key] = String.fromCharCode(...text.slice(index + 1));
+          const key = latin1(text.slice(0, index));
+          this.text[key] = latin1(text.slice(index + 1));
           break;
+        }
 
-        case 'IEND':
+        case 'IEND': {
           // we've got everything we need!
           switch (this.colorType) {
             case 0:
@@ -114,9 +342,19 @@ export default class PNG {
               break;
           }
 
-          this.imgData = Buffer.from(this.imgData);
+          this.imgData = new Uint8Array(idatLength);
+          let offset = 0;
+          for (i = 0; i < idatChunks.length; i++) {
+            this.imgData.set(idatChunks[i], offset);
+            offset += idatChunks[i].length;
+          }
+
+          // Everything kept past construction (imgData, palette,
+          // transparency, text) is copied out of the source buffer, so
+          // release it rather than pinning the whole file on the instance.
+          this.data = null;
           return;
-          break;
+        }
 
         default:
           // unknown (or unimportant) section, skip it
@@ -124,18 +362,14 @@ export default class PNG {
       }
 
       this.pos += 4; // Skip the CRC
-
-      if (this.pos > this.data.length) {
-        throw new Error('Incomplete or corrupt PNG file');
-      }
     }
   }
 
   read(bytes) {
-    const result = new Array(bytes);
-    for (let i = 0; i < bytes; i++) {
-      result[i] = this.data[this.pos++];
-    }
+    // Array.from copies, so the result never pins the source buffer.
+    // These stay plain arrays: consumers index and push into them.
+    const result = Array.from(this.data.subarray(this.pos, this.pos + bytes));
+    this.pos += bytes;
     return result;
   }
 
@@ -144,179 +378,46 @@ export default class PNG {
     const b2 = this.data[this.pos++] << 16;
     const b3 = this.data[this.pos++] << 8;
     const b4 = this.data[this.pos++];
-    return b1 | b2 | b3 | b4;
+    return (b1 | b2 | b3 | b4) >>> 0;
   }
 
-  readUInt16() {
-    const b1 = this.data[this.pos++] << 8;
-    const b2 = this.data[this.pos++];
-    return b1 | b2;
-  }
+  async decodePixels() {
+    // The inflate callback references only this plain metadata, never
+    // `this`, so a caller that drops the instance doesn't keep it alive
+    // through the async inflate.
+    const meta = {
+      width: this.width,
+      height: this.height,
+      interlaceMethod: this.interlaceMethod,
+      pixelBitlength: this.pixelBitlength
+    };
+    const input = this.imgData;
 
-  decodePixels(fn) {
-    return zlib.inflate(this.imgData, (err, data) => {
-      if (err) {
-        throw err;
-      }
-
-      const { width, height } = this;
-      const pixelBytes = this.pixelBitlength / 8;
-
-      const pixels = Buffer.from(width * height * pixelBytes);
-      const { length } = data;
-      let pos = 0;
-
-      function pass(x0, y0, dx, dy, singlePass = false) {
-        const w = Math.ceil((width - x0) / dx);
-        const h = Math.ceil((height - y0) / dy);
-        const scanlineLength = pixelBytes * w;
-        const buffer = singlePass ? pixels : Buffer.from(scanlineLength * h);
-        let row = 0;
-        let c = 0;
-        while (row < h && pos < length) {
-          let byte;
-          let col;
-          let i;
-          let left;
-          let upper;
-          switch (data[pos++]) {
-            case 0: // None
-              for (i = 0; i < scanlineLength; i++) {
-                buffer[c++] = data[pos++];
-              }
-              break;
-
-            case 1: // Sub
-              for (i = 0; i < scanlineLength; i++) {
-                byte = data[pos++];
-                left = i < pixelBytes ? 0 : buffer[c - pixelBytes];
-                buffer[c++] = (byte + left) % 256;
-              }
-              break;
-
-            case 2: // Up
-              for (i = 0; i < scanlineLength; i++) {
-                byte = data[pos++];
-                col = (i - (i % pixelBytes)) / pixelBytes;
-                upper =
-                  row &&
-                  buffer[
-                    (row - 1) * scanlineLength +
-                      col * pixelBytes +
-                      (i % pixelBytes)
-                  ];
-                buffer[c++] = (upper + byte) % 256;
-              }
-              break;
-
-            case 3: // Average
-              for (i = 0; i < scanlineLength; i++) {
-                byte = data[pos++];
-                col = (i - (i % pixelBytes)) / pixelBytes;
-                left = i < pixelBytes ? 0 : buffer[c - pixelBytes];
-                upper =
-                  row &&
-                  buffer[
-                    (row - 1) * scanlineLength +
-                      col * pixelBytes +
-                      (i % pixelBytes)
-                  ];
-                buffer[c++] = (byte + Math.floor((left + upper) / 2)) % 256;
-              }
-              break;
-
-            case 4: // Paeth
-              for (i = 0; i < scanlineLength; i++) {
-                let paeth;
-                let upperLeft;
-                byte = data[pos++];
-                col = (i - (i % pixelBytes)) / pixelBytes;
-                left = i < pixelBytes ? 0 : buffer[c - pixelBytes];
-
-                if (row === 0) {
-                  upper = upperLeft = 0;
-                } else {
-                  upper =
-                    buffer[
-                      (row - 1) * scanlineLength +
-                        col * pixelBytes +
-                        (i % pixelBytes)
-                    ];
-                  upperLeft =
-                    col &&
-                    buffer[
-                      (row - 1) * scanlineLength +
-                        (col - 1) * pixelBytes +
-                        (i % pixelBytes)
-                    ];
-                }
-
-                const p = left + upper - upperLeft;
-                const pa = Math.abs(p - left);
-                const pb = Math.abs(p - upper);
-                const pc = Math.abs(p - upperLeft);
-
-                if (pa <= pb && pa <= pc) {
-                  paeth = left;
-                } else if (pb <= pc) {
-                  paeth = upper;
-                } else {
-                  paeth = upperLeft;
-                }
-
-                buffer[c++] = (byte + paeth) % 256;
-              }
-              break;
-
-            default:
-              throw new Error(`Invalid filter algorithm: ${data[pos - 1]}`);
-          }
-
-          if (!singlePass) {
-            let pixelsPos = ((y0 + row * dy) * width + x0) * pixelBytes;
-            let bufferPos = row * scanlineLength;
-            for (i = 0; i < w; i++) {
-              for (let j = 0; j < pixelBytes; j++)
-                pixels[pixelsPos++] = buffer[bufferPos++];
-              pixelsPos += (dx - 1) * pixelBytes;
-            }
-          }
-
-          row++;
+    return new Promise((resolve, reject) => {
+      inflate(input, (err, data) => {
+        if (err) {
+          reject(err);
+          return;
         }
-      }
 
-      if (this.interlaceMethod === 1) {
-        /*
-          1 6 4 6 2 6 4 6
-          7 7 7 7 7 7 7 7
-          5 6 5 6 5 6 5 6
-          7 7 7 7 7 7 7 7
-          3 6 4 6 3 6 4 6
-          7 7 7 7 7 7 7 7
-          5 6 5 6 5 6 5 6
-          7 7 7 7 7 7 7 7
-        */
-        pass(0, 0, 8, 8); // 1
-        pass(4, 0, 8, 8); // 2
-        pass(0, 4, 4, 8); // 3
-        pass(2, 0, 4, 4); // 4
-        pass(0, 2, 2, 4); // 5
-        pass(1, 0, 2, 2); // 6
-        pass(0, 1, 1, 2); // 7
-      } else {
-        pass(0, 0, 1, 1, true);
-      }
-
-      return fn(pixels);
+        try {
+          resolve(decodePixelsData(meta, data));
+        } catch (error) {
+          reject(error);
+        }
+      });
     });
+  }
+
+  decodePixelsSync() {
+    return decodePixelsData(this, inflateSync(this.imgData));
   }
 
   decodePalette() {
     const { palette } = this;
     const { length } = palette;
     const transparency = this.transparency.indexed || [];
-    const ret = Buffer.from(transparency.length + length);
+    const ret = new Uint8Array(transparency.length + length);
     let pos = 0;
     let c = 0;
 
@@ -372,26 +473,10 @@ export default class PNG {
     }
   }
 
-  decode(fn) {
-    const ret = Buffer.from(this.width * this.height * 4);
-    return this.decodePixels(pixels => {
-      this.copyToImageData(ret, pixels);
-      return fn(ret);
-    });
+  async decode() {
+    const ret = new Uint8Array(this.width * this.height * 4);
+    const pixels = await this.decodePixels();
+    this.copyToImageData(ret, pixels);
+    return ret;
   }
-};
-
-
-
-const main = async () => {
-  const data = fs.readFileSync('./rgb-8bit.png');
-  const png = new PNG(data);
-  const pixels = await new Promise((resolve, reject) => {
-    png.decode((pixels) => {
-      resolve(pixels);
-    });
-  });
-  console.log(pixels);
 }
-
-main();

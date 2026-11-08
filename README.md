@@ -10,12 +10,18 @@ Install the module
     
 import the module and decode a PNG
 
-    var PNG = require('png-js');
-    PNG.decode('some.png', function(pixels) {
-        // pixels is a 1d array (in rgba order) of decoded pixel data
-    });
-    
-You can also call `PNG.load` if you want to load the PNG (but not decode the pixels) synchronously.  If you already
-have the PNG data in a buffer, simply use `new PNG(buffer)`.  In both of these cases, you need to call `png.decode`
-yourself which passes your callback the decoded pixels as a buffer.  If you already have a buffer you want the pixels
-copied to, call `copyToImageData` with your buffer and the decoded pixels as returned from `decodePixels`.
+    import PNG from 'portable-network-graphics.js';
+
+    // RGBA pixels as a Uint8Array
+    const pixels = await PNG.decode('some.png');
+
+You can also call `PNG.load(path)` to load the PNG (but not decode the pixels) synchronously. If you already
+have the PNG data in a buffer, simply use `new PNG(buffer)`. Then call:
+
+- `await png.decode()` for RGBA pixels
+- `await png.decodePixels()` / `png.decodePixelsSync()` for the raw pixel bytes
+- `png.copyToImageData(buffer, pixels)` to copy decoded pixels into your own RGBA buffer
+
+Malformed files throw (constructor) or reject (async decode); they never throw uncaught.
+
+Run the tests with `npm test`.
